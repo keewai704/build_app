@@ -140,7 +140,7 @@ jobs:
           restore-keys: |
             nxnative-work-${{ vars.TITLE_ID || 'game' }}-v1-
 
-      - uses: actions/setup-python@6d4fd22b20465ccc0f735447658e8df7c9ca0e0 # v7.1.0
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: '3.14'
           cache: pip
