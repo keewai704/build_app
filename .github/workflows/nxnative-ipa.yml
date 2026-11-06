@@ -1,0 +1,335 @@
+# Build your game's IPA with the newest nxnative (https://github.com/seedds/nxnative),
+# whenever its upstream main moves, and keep exactly one build in the artifacts: the newest
+# upstream commit whose build succeeded.
+#
+# An nxnative IPA always wraps one game. The game files (a folder of NSP/XCI/NSZ files, a dump
+# folder, or one .nup file) and, for NSP/XCI/NSZ, prod.keys are yours to provide; they are
+# never committed to this repository. Set one game source before the first run:
+#
+#   secrets.GAME_URL    URL of a zip/tar archive of the game folder, or of one .nup file
+#                       (cloud storage, your server, a private GitHub release asset, ...)
+#   or, for a private repository that holds the game folder at its root:
+#   vars.GAME_REPO      the repository, e.g. your-name/nxnative-game
+#   secrets.GAME_PAT    a fine-grained personal access token that can read that repository
+#
+#   secrets.PROD_KEYS_B64   base64-encoded prod.keys (not needed for a .nup or a dump folder)
+#
+# Optional repository variables:
+#   vars.TITLE_ID      the game to pack when the folder holds several (16 hex digits)
+#   vars.ROMFS         bundle (default): the game files go into the IPA; separate: the IPA
+#                      stays small and the game files are copied to the phone once with
+#                      scripts/push_romfs.sh (see the nxnative README)
+#   vars.LANGUAGE      the language packed as the game's default, e.g. ja (empty = English)
+#
+# How it runs: every 6 hours (and manually) the check job looks at the newest commit of
+# seedds/nxnative and skips the build when that commit's IPA is already in the artifacts.
+# A build that succeeds uploads its IPA as artifact nxnative-ipa-<commit> and then deletes
+# every older build's artifact, so exactly one build stays. A failed build deletes nothing:
+# the previous IPA stays until a newer commit builds (the next run retries automatically).
+#
+# Keep this repository private: the artifact contains the game, and artifacts of a public
+# repository can be downloaded by anyone. On a private repository GitHub bills macOS runners
+# against the plan's included minutes; the check job is seconds on Linux and skips the
+# macOS build entirely when upstream has not moved.
+
+name: nxnative IPA
+
+on:
+  schedule:
+    - cron: '23 */6 * * *'   # look upstream every 6 hours, at :23 to miss the busy top of the hour
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Upstream ref to build (branch, tag or SHA)'
+        default: main
+        type: string
+      force:
+        description: 'Rebuild even when this commit is already built (also after a game update)'
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+  actions: write   # list and delete the build artifacts
+
+# One build at a time; a running build is never cancelled, later runs wait behind it.
+concurrency:
+  group: nxnative-ipa
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: seedds/nxnative
+  ARTIFACT_PREFIX: nxnative-ipa-   # + the built commit: one artifact stays at a time
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  check:
+    name: Check upstream for a new commit
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      sha: ${{ steps.head.outputs.sha }}
+      short: ${{ steps.head.outputs.short }}
+      build: ${{ steps.decide.outputs.build }}
+    steps:
+      - name: Newest upstream commit
+        id: head
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REF: ${{ inputs.ref || 'main' }}
+        run: |
+          SHA=$(gh api "repos/$UPSTREAM_REPO/commits/$REF" --jq .sha)
+          echo "upstream $UPSTREAM_REPO@$REF -> $SHA"
+          {
+            echo "sha=$SHA"
+            echo "short=${SHA:0:12}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Build, or skip when this commit's IPA is already built
+        id: decide
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHORT: ${{ steps.head.outputs.short }}
+          FORCE: ${{ inputs.force == true }}
+        run: |
+          want="$ARTIFACT_PREFIX$SHORT"
+          if [ "$FORCE" = true ]; then
+            echo "forced rebuild"
+            echo "build=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          names=$(gh api --paginate "repos/$GITHUB_REPOSITORY/actions/artifacts?per_page=100" \
+            | jq -r --arg p "$ARTIFACT_PREFIX" '.[] | select(.name | startswith($p)) | .name')
+          if printf '%s\n' "$names" | grep -qxF "$want"; then
+            echo "$want is already built; nothing to do"
+            echo "build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "no artifact for this commit yet; building"
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    name: Build the IPA
+    needs: check
+    if: needs.check.outputs.build == 'true'
+    # GitHub's macOS 27 image with Xcode 27.2, the toolchain nxnative supports, as nxnative's own CI uses
+    runs-on: xcode-27
+    timeout-minutes: 150
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_27.2.app/Contents/Developer
+      HOMEBREW_NO_AUTO_UPDATE: 1
+    steps:
+      - name: Checkout nxnative at the commit to build
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: seedds/nxnative
+          ref: ${{ needs.check.outputs.sha }}
+          path: nxnative
+          persist-credentials: false
+
+      - name: Reuse the last build's work folder (extracted files, rewritten modules, shader caches)
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/work
+          # a fresh entry every run, restored from the newest previous one; the cache is capped
+          # at 10 GB per repository, so a very large game may not fit (the build still works)
+          key: nxnative-work-${{ vars.TITLE_ID || 'game' }}-v1-${{ github.run_id }}
+          restore-keys: |
+            nxnative-work-${{ vars.TITLE_ID || 'game' }}-v1-
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f735447658e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.14'
+          cache: pip
+          cache-dependency-path: nxnative/.github/requirements/tools.txt
+      - name: Python packages the tools import
+        run: python3 -m pip install -r nxnative/.github/requirements/tools.txt
+
+      - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          dotnet-version: '10.0.x'   # the shader translator (dmsh_xlate_bin) targets net10.0
+
+      - name: Xcode's Metal toolchain (a separate component, not in the runner image)
+        run: xcodebuild -downloadComponent MetalToolchain
+
+      - name: xcodegen and glslang (zstd and the .NET SDK are in the image)
+        run: |
+          command -v zstd >/dev/null || brew install zstd
+          brew install xcodegen glslang
+
+      - name: Where the game comes from
+        id: gamesource
+        env:
+          GAME_REPO: ${{ vars.GAME_REPO }}
+          GAME_URL: ${{ secrets.GAME_URL }}
+        run: |
+          if [ -n "$GAME_REPO" ]; then
+            echo "game: the private repository $GAME_REPO"
+            echo "source=repo" >> "$GITHUB_OUTPUT"
+          elif [ -n "$GAME_URL" ]; then
+            echo "game: the GAME_URL download"
+            echo "source=url" >> "$GITHUB_OUTPUT"
+          else
+            echo "::error::No game source: set secrets.GAME_URL (a zip or tar of the game folder, or one .nup file), or vars.GAME_REPO with secrets.GAME_PAT (a private repository holding the game folder at its root). See the comment at the top of this workflow."
+            exit 1
+          fi
+
+      - name: Fetch the game (private repository)
+        if: steps.gamesource.outputs.source == 'repo'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ vars.GAME_REPO }}
+          token: ${{ secrets.GAME_PAT }}
+          path: game
+          persist-credentials: false
+
+      - name: Fetch the game (download)
+        if: steps.gamesource.outputs.source == 'url'
+        env:
+          GAME_URL: ${{ secrets.GAME_URL }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/game" && cd "$RUNNER_TEMP/game"
+          name=$(basename "${GAME_URL%%\?*}")   # the URL's file name, without its query string
+          if [ -z "$name" ]; then
+            echo "::error::GAME_URL does not end in a file name (zip, tar or .nup)"
+            exit 1
+          fi
+          echo "downloading $name"
+          curl -fsSL --retry 3 -o "$name" "$GAME_URL"
+          case "$name" in
+            *.zip)                                 unzip -q "$name" && rm "$name" ;;
+            *.tar|*.tar.gz|*.tgz|*.tar.xz|*.txz)   tar -xf "$name" && rm "$name" ;;
+            *.nup)                                 : ;;   # one NUP container: the file itself
+            *) echo "::warning::$name: not a zip, tar or .nup; passing it on as is" ;;
+          esac
+          # One .nup at the top: build from the file. Otherwise the folder is the game input;
+          # when the top level holds only one directory, step into it (the usual zip wrapper).
+          shopt -s nullglob
+          nups=(*.nup)
+          if [ ${#nups[@]} -eq 1 ] && [ ! -d "${nups[0]}" ]; then
+            input="$PWD/${nups[0]}"
+          else
+            shopt -s dotglob
+            entries=(*)
+            if [ ${#entries[@]} -eq 1 ] && [ -d "${entries[0]}" ]; then
+              input="$PWD/${entries[0]}"
+            else
+              input="$PWD"
+            fi
+          fi
+          echo "game input: $input"
+          echo "GAME_INPUT=$input" >> "$GITHUB_ENV"
+
+      - name: Game input (private repository)
+        if: steps.gamesource.outputs.source == 'repo'
+        run: echo "GAME_INPUT=$GITHUB_WORKSPACE/game" >> "$GITHUB_ENV"
+
+      - name: prod.keys
+        env:
+          PROD_KEYS_B64: ${{ secrets.PROD_KEYS_B64 }}
+        run: |
+          if [ -n "$PROD_KEYS_B64" ]; then
+            printf '%s' "$PROD_KEYS_B64" | python3 -c \
+              'import base64, sys; open(sys.argv[1], "wb").write(base64.b64decode("".join(sys.stdin.read().split())))' \
+              "$RUNNER_TEMP/prod.keys"
+            echo "prod.keys written (not needed for a .nup or a dump folder)"
+            echo "PROD_KEYS=$RUNNER_TEMP/prod.keys" >> "$GITHUB_ENV"
+          else
+            echo "no prod.keys given"
+          fi
+
+      - name: Disk space (the build needs about twice the game's size plus 10 GB free)
+        run: df -h /
+
+      - name: Build the IPA
+        env:
+          SHORT: ${{ needs.check.outputs.short }}
+          TITLE_ID: ${{ vars.TITLE_ID }}
+          ROMFS: ${{ vars.ROMFS || 'bundle' }}
+          LANGUAGE: ${{ vars.LANGUAGE }}
+        run: |
+          set -euo pipefail
+          cd nxnative
+          mkdir -p "$RUNNER_TEMP/out"
+          args=(--work-dir "$RUNNER_TEMP/work" -o "$RUNNER_TEMP/out/nxnative-$SHORT.ipa" --progress lines)
+          if [ -n "${PROD_KEYS:-}" ]; then args+=(-k "$PROD_KEYS"); fi
+          if [ -n "${TITLE_ID:-}" ]; then args+=(--title-id "$TITLE_ID"); fi
+          if [ "${ROMFS:-bundle}" = separate ]; then args+=(--romfs separate); fi
+          if [ -n "${LANGUAGE:-}" ]; then args+=(-l "$LANGUAGE"); fi
+          python3 scripts/build_ipa_from_nsp.py "$GAME_INPUT" "${args[@]}"
+
+      - name: Build info
+        env:
+          SHA: ${{ needs.check.outputs.sha }}
+          SHORT: ${{ needs.check.outputs.short }}
+        run: |
+          shopt -s nullglob
+          ipas=("$RUNNER_TEMP"/out/nxnative-*.ipa)
+          if [ ${#ipas[@]} -ne 1 ]; then
+            echo "::error::expected one IPA, found ${#ipas[@]}"
+            exit 1
+          fi
+          ipa=${ipas[0]}
+          {
+            echo "nxnative: https://github.com/seedds/nxnative/commit/$SHA"
+            echo "built:   $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+            echo "ipa:     $(basename "$ipa") ($(du -h "$ipa" | cut -f1))"
+          } | tee "$RUNNER_TEMP/out/BUILD-INFO.txt"
+
+      - name: Upload the IPA
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ env.ARTIFACT_PREFIX }}${{ needs.check.outputs.short }}
+          path: |
+            ${{ runner.temp }}/out/nxnative-*.ipa
+            ${{ runner.temp }}/out/BUILD-INFO.txt
+          if-no-files-found: error
+
+      - name: Delete the stale builds (keep only this one)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHORT: ${{ needs.check.outputs.short }}
+        run: |
+          set -euo pipefail
+          keep="$ARTIFACT_PREFIX$SHORT"
+          rows=$(gh api --paginate "repos/$GITHUB_REPOSITORY/actions/artifacts?per_page=100" \
+            | jq -r --arg p "$ARTIFACT_PREFIX" '.[] | select(.name | startswith($p)) | "\(.id)\t\(.name)"')
+          # the artifact just uploaded: the one with this name and the greatest id
+          keep_id=$(printf '%s\n' "$rows" | awk -F'\t' -v n="$keep" '$2 == n { if ($1 > m) m = $1 } END { print m }')
+          if [ -z "$keep_id" ]; then
+            echo "::error::the new artifact $keep was not found"
+            exit 1
+          fi
+          printf '%s\n' "$rows" | awk -F'\t' -v k="$keep_id" '$1 != k' | cut -f1 \
+            | while read -r id; do
+                echo "deleting stale build artifact $id"
+                gh api -X DELETE "repos/$GITHUB_REPOSITORY/actions/artifacts/$id"
+              done
+          echo "kept artifact $keep_id ($keep)"
+
+      - name: Summary
+        env:
+          SHA: ${{ needs.check.outputs.sha }}
+          SHORT: ${{ needs.check.outputs.short }}
+        run: |
+          shopt -s nullglob
+          ipa=($RUNNER_TEMP/out/nxnative-*.ipa)
+          {
+            echo "## nxnative IPA"
+            echo "- nxnative: $SHORT (https://github.com/seedds/nxnative/commit/$SHA)"
+            echo "- artifact: $ARTIFACT_PREFIX$SHORT — $(du -h "${ipa[0]}" | cut -f1)"
+            echo "- install with AltStore / Sideloadly / LiveContainer, Increased Memory Limit on"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Build logs (on failure)
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: build-logs-${{ needs.check.outputs.short }}
+          path: ${{ runner.temp }}/work/logs
+          if-no-files-found: ignore
+          retention-days: 7
